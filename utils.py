@@ -1,3 +1,11 @@
+"""
+utils.py
+Modul bantu untuk aplikasi Pencatatan Keuangan Bendahara KKN.
+Backend penyimpanan data: Google Sheets (via gspread + Service Account).
+Mendukung 2 kas: Kas Umum & Kas Proker, plus transfer antar kas.
+Berisi juga: kategori default, format rupiah, dan export laporan ke Excel & PDF.
+"""
+
 import io
 import time
 from datetime import datetime
@@ -9,7 +17,9 @@ from google.oauth2.service_account import Credentials
 from gspread.exceptions import SpreadsheetNotFound, WorksheetNotFound, APIError
 from fpdf import FPDF
 
-
+# ----------------------------------------------------------------------
+# KONFIGURASI GOOGLE SHEETS
+# ----------------------------------------------------------------------
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -55,7 +65,8 @@ KATEGORI_DEFAULT = {
     ],
 }
 
-
+# Kategori yang boleh dipilih manual di form Input Transaksi (tanpa kategori transfer,
+# karena transfer wajib lewat menu "Transfer Antar Kas" agar saldo tetap seimbang).
 KATEGORI_INPUT_MANUAL = {
     jenis: [k for k in daftar if k != KATEGORI_TRANSFER]
     for jenis, daftar in KATEGORI_DEFAULT.items()
@@ -66,6 +77,7 @@ PROKER_UMUM_PLACEHOLDER = PROKER_DEFAULT[0]
 
 
 def _retry(func, *args, max_retries=4, base_delay=2, **kwargs):
+    """Panggil fungsi gspread dengan retry otomatis (exponential backoff) jika kena rate limit (429)."""
     for attempt in range(max_retries + 1):
         try:
             return func(*args, **kwargs)
@@ -77,6 +89,9 @@ def _retry(func, *args, max_retries=4, base_delay=2, **kwargs):
             raise
 
 
+# ----------------------------------------------------------------------
+# KONEKSI GOOGLE SHEETS
+# ----------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def get_gspread_client():
     creds_dict = dict(st.secrets["gcp_service_account"])
@@ -87,11 +102,11 @@ def get_gspread_client():
 @st.cache_resource(show_spinner=False)
 def get_spreadsheet():
     client = get_gspread_client()
-
+    # Prioritaskan SPREADSHEET_ID (unik, tidak mungkin salah sasaran file).
     spreadsheet_id = st.secrets.get("SPREADSHEET_ID", "").strip()
     if spreadsheet_id:
         return _retry(client.open_by_key, spreadsheet_id)
-
+    # Fallback: cari berdasarkan nama (kurang aman jika ada file dengan nama sama).
     spreadsheet_name = st.secrets.get("SPREADSHEET_NAME", "Keuangan KKN")
     return _retry(client.open, spreadsheet_name)
 
@@ -108,19 +123,20 @@ def get_worksheet(name, headers):
 
 
 def _migrate_transaksi_schema():
+    """Migrasi otomatis jika header sheet Transaksi lama (belum ada kolom 'Kas')."""
     ws = get_worksheet(TRANSAKSI_SHEET, TRANSAKSI_COLUMNS)
     all_values = _retry(ws.get_all_values)
     if not all_values:
         return
     header = all_values[0]
     if header == TRANSAKSI_COLUMNS:
-        return
+        return  # sudah sesuai skema terbaru
 
     old_rows = all_values[1:]
     old_df = pd.DataFrame(old_rows, columns=header) if old_rows else pd.DataFrame(columns=header)
 
     if "Kas" not in old_df.columns:
-        old_df["Kas"] = "Kas Umum"
+        old_df["Kas"] = "Kas Umum"  # data lama dianggap Kas Umum secara default
 
     for col in TRANSAKSI_COLUMNS:
         if col not in old_df.columns:
@@ -135,6 +151,9 @@ def _migrate_transaksi_schema():
 
 
 def init_data():
+    """Pastikan koneksi ke Google Sheets berhasil, worksheet & skema tersedia.
+    Hanya dijalankan sekali per sesi browser untuk menghemat kuota Google Sheets API,
+    karena Streamlit menjalankan ulang seluruh skrip setiap ada interaksi."""
     if st.session_state.get("_init_data_done"):
         return
 
@@ -172,6 +191,9 @@ def init_data():
     st.session_state["_init_data_done"] = True
 
 
+# ----------------------------------------------------------------------
+# DATA TRANSAKSI
+# ----------------------------------------------------------------------
 @st.cache_data(ttl=15, show_spinner=False)
 def load_transaksi() -> pd.DataFrame:
     ws = get_worksheet(TRANSAKSI_SHEET, TRANSAKSI_COLUMNS)
@@ -208,6 +230,11 @@ def add_transaksi(tanggal, jenis, kas, proker, kategori, keterangan, jumlah):
 
 
 def add_transfer(tanggal, arah, proker, jumlah, keterangan=""):
+    """
+    Catat transfer antar kas sebagai sepasang transaksi (saling menyeimbangkan):
+    - arah "Kas Umum ke Kas Proker": Kas Umum berkurang, Kas Proker (proker terkait) bertambah
+    - arah "Kas Proker ke Kas Umum": Kas Proker (proker terkait) berkurang, Kas Umum bertambah
+    """
     jumlah = float(jumlah)
     catatan = keterangan.strip()
     tambahan = f" - {catatan}" if catatan else ""
@@ -221,7 +248,7 @@ def add_transfer(tanggal, arah, proker, jumlah, keterangan=""):
             tanggal, "Pemasukan", "Kas Proker", proker, KATEGORI_TRANSFER,
             f"Transfer dari Kas Umum{tambahan}", jumlah,
         )
-    else:
+    else:  # "Kas Proker ke Kas Umum"
         add_transaksi(
             tanggal, "Pengeluaran", "Kas Proker", proker, KATEGORI_TRANSFER,
             f"Transfer ke Kas Umum{tambahan}", jumlah,
@@ -235,11 +262,12 @@ def add_transfer(tanggal, arah, proker, jumlah, keterangan=""):
 
 
 def _find_row_index(ws, id_) -> int | None:
-    ids = _retry(ws.col_values, 1)[1:]
+    """Cari nomor baris (1-indexed, termasuk header) berdasarkan ID di kolom A."""
+    ids = _retry(ws.col_values, 1)[1:]  # lewati header
     target = str(int(id_))
     for i, val in enumerate(ids):
         if str(val).strip() == target:
-            return i + 2
+            return i + 2  # +1 utk header, +1 utk index 0-based -> 1-based
     return None
 
 
@@ -263,6 +291,9 @@ def delete_transaksi(id_):
     return load_transaksi()
 
 
+# ----------------------------------------------------------------------
+# DATA PROKER / KEGIATAN
+# ----------------------------------------------------------------------
 @st.cache_data(ttl=15, show_spinner=False)
 def load_proker() -> list:
     ws = get_worksheet(PROKER_SHEET, PROKER_COLUMNS)
@@ -299,6 +330,9 @@ def delete_proker(nama: str):
     return load_proker()
 
 
+# ----------------------------------------------------------------------
+# DATA ANGGOTA
+# ----------------------------------------------------------------------
 @st.cache_data(ttl=15, show_spinner=False)
 def load_anggota() -> list:
     ws = get_worksheet(ANGGOTA_SHEET, ANGGOTA_COLUMNS)
@@ -333,6 +367,9 @@ def delete_anggota(nama: str):
     return load_anggota()
 
 
+# ----------------------------------------------------------------------
+# PENGATURAN (KEY-VALUE)
+# ----------------------------------------------------------------------
 @st.cache_data(ttl=15, show_spinner=False)
 def load_pengaturan() -> dict:
     ws = get_worksheet(PENGATURAN_SHEET, PENGATURAN_COLUMNS)
@@ -363,11 +400,45 @@ def set_nominal_kas_mingguan(value):
     set_pengaturan(KEY_NOMINAL_KAS_MINGGUAN, float(value))
 
 
+# ----------------------------------------------------------------------
+# IURAN KAS ANGGOTA (MINGGUAN)
+# ----------------------------------------------------------------------
 @st.cache_data(ttl=15, show_spinner=False)
 def load_iuran() -> pd.DataFrame:
+    """Muat data Iuran Kas.
+
+    Sengaja pakai get_all_values() + pemetaan kolom manual (bukan
+    get_all_records()) supaya kebal terhadap masalah baris header di sheet
+    (header kosong/duplikat/kolom ekstra) yang biasanya bikin gspread
+    melempar GSpreadException.
+    """
     ws = get_worksheet(IURAN_SHEET, IURAN_COLUMNS)
-    records = _retry(ws.get_all_records)
-    df = pd.DataFrame(records)
+    all_values = _retry(ws.get_all_values)
+    if not all_values or len(all_values) < 2:
+        return pd.DataFrame(columns=IURAN_COLUMNS)
+
+    header = all_values[0]
+    data_rows = all_values[1:]
+
+    # Petakan tiap kolom yang diharapkan (IURAN_COLUMNS) ke posisinya di
+    # header sheet. Kolom header yang kosong/duplikat/tidak dikenal diabaikan.
+    col_index = {}
+    for idx, nama_kolom in enumerate(header):
+        nama_kolom = nama_kolom.strip()
+        if nama_kolom in IURAN_COLUMNS and nama_kolom not in col_index:
+            col_index[nama_kolom] = idx
+
+    records = []
+    for row in data_rows:
+        if not any(cell.strip() for cell in row):
+            continue  # lewati baris yang benar-benar kosong
+        record = {
+            kolom: (row[col_index[kolom]] if kolom in col_index and col_index[kolom] < len(row) else "")
+            for kolom in IURAN_COLUMNS
+        }
+        records.append(record)
+
+    df = pd.DataFrame(records, columns=IURAN_COLUMNS)
     if df.empty:
         df = pd.DataFrame(columns=IURAN_COLUMNS)
     else:
@@ -383,6 +454,20 @@ def _next_iuran_id(df: pd.DataFrame) -> int:
 
 
 def mark_iuran_paid(minggu_label: str, nama: str, tanggal_bayar):
+    """Tandai anggota sudah bayar iuran minggu tsb: buat transaksi Pemasukan + catatan iuran.
+
+    Idempoten: jika anggota tsb sudah tercatat bayar untuk minggu yang sama
+    (misalnya karena checkbox ter-klik dua kali/koneksi lambat), fungsi ini
+    TIDAK akan membuat transaksi/catatan baru lagi - supaya kas tidak
+    tercatat dobel.
+    """
+    df_iuran = load_iuran()
+    sudah_tercatat = not df_iuran[
+        (df_iuran["Minggu"] == minggu_label) & (df_iuran["Nama Anggota"] == nama)
+    ].empty
+    if sudah_tercatat:
+        return df_iuran
+
     nominal = get_nominal_kas_mingguan()
     df_trans = add_transaksi(
         tanggal_bayar, "Pemasukan", "Kas Umum", PROKER_UMUM_PLACEHOLDER, "Kas Anggota",
@@ -391,7 +476,6 @@ def mark_iuran_paid(minggu_label: str, nama: str, tanggal_bayar):
     new_trans_id = int(df_trans["ID"].max()) if not df_trans.empty else 0
 
     ws = get_worksheet(IURAN_SHEET, IURAN_COLUMNS)
-    df_iuran = load_iuran()
     new_id = _next_iuran_id(df_iuran)
     row = [new_id, minggu_label, nama, str(tanggal_bayar), new_trans_id]
     _retry(ws.append_row, row, value_input_option="USER_ENTERED")
@@ -400,26 +484,38 @@ def mark_iuran_paid(minggu_label: str, nama: str, tanggal_bayar):
 
 
 def unmark_iuran_paid(minggu_label: str, nama: str):
+    """Batalkan status sudah bayar: hapus transaksi terkait + catatan iuran.
+
+    Menghapus SEMUA baris yang cocok (bukan cuma yang pertama), untuk
+    membersihkan sisa data dobel jika pernah tercatat lebih dari sekali
+    sebelum guard anti-duplikat ini ada.
+    """
     df_iuran = load_iuran()
     match = df_iuran[(df_iuran["Minggu"] == minggu_label) & (df_iuran["Nama Anggota"] == nama)]
     if match.empty:
         return load_iuran()
 
-    row = match.iloc[0]
-    id_transaksi = int(row["ID Transaksi"])
-    id_iuran = int(row["ID"])
+    for _, row in match.iterrows():
+        id_transaksi = int(row["ID Transaksi"])
+        id_iuran = int(row["ID"])
 
-    if id_transaksi:
-        delete_transaksi(id_transaksi)
+        if id_transaksi:
+            delete_transaksi(id_transaksi)
 
-    ws = get_worksheet(IURAN_SHEET, IURAN_COLUMNS)
-    row_idx = _find_row_index(ws, id_iuran)
-    if row_idx is not None:
-        _retry(ws.delete_rows, row_idx)
+        ws = get_worksheet(IURAN_SHEET, IURAN_COLUMNS)
+        row_idx = _find_row_index(ws, id_iuran)
+        if row_idx is not None:
+            _retry(ws.delete_rows, row_idx)
+
     load_iuran.clear()
     return load_iuran()
 
 
+
+
+# ----------------------------------------------------------------------
+# FORMAT & PERHITUNGAN
+# ----------------------------------------------------------------------
 def format_rupiah(value) -> str:
     try:
         value = float(value)
@@ -441,6 +537,7 @@ def hitung_ringkasan(df: pd.DataFrame) -> dict:
 
 
 def hitung_ringkasan_per_kas(df: pd.DataFrame) -> dict:
+    """Kembalikan ringkasan saldo terpisah untuk Kas Umum, Kas Proker, dan totalnya."""
     hasil = {}
     for kas in KAS_OPTIONS:
         hasil[kas] = hitung_ringkasan(df[df["Kas"] == kas])
@@ -448,6 +545,9 @@ def hitung_ringkasan_per_kas(df: pd.DataFrame) -> dict:
     return hasil
 
 
+# ----------------------------------------------------------------------
+# EXPORT EXCEL
+# ----------------------------------------------------------------------
 def generate_excel(df: pd.DataFrame, judul="Laporan Keuangan KKN") -> bytes:
     output = io.BytesIO()
     df_export = df.copy().sort_values("Tanggal")
@@ -480,6 +580,9 @@ def generate_excel(df: pd.DataFrame, judul="Laporan Keuangan KKN") -> bytes:
     return output.getvalue()
 
 
+# ----------------------------------------------------------------------
+# EXPORT PDF
+# ----------------------------------------------------------------------
 class LaporanPDF(FPDF):
     def header(self):
         self.set_font("Helvetica", "B", 14)
