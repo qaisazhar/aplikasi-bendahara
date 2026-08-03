@@ -89,30 +89,6 @@ def _retry(func, *args, max_retries=4, base_delay=2, **kwargs):
             raise
 
 
-def _get_records_safe(ws, expected_columns):
-    """Ambil isi worksheet sebagai list of dict TANPA memakai ws.get_all_records().
-
-    ws.get_all_records() bawaan gspread memvalidasi baris header secara ketat dan akan
-    melempar GSpreadException jika ada header kosong/duplikat/tidak konsisten (misalnya
-    akibat sheet pernah diedit manual, atau proses migrasi skema lama). Fungsi ini
-    membaca nilai mentah lalu memetakan setiap baris ke `expected_columns` (kolom yang
-    KITA definisikan di kode), sehingga tidak bergantung pada isi baris header di sheet
-    dan lebih tahan terhadap data yang sedikit berantakan.
-    """
-    all_values = _retry(ws.get_all_values)
-    if len(all_values) < 2:
-        return []
-    rows = all_values[1:]
-    n = len(expected_columns)
-    records = []
-    for row in rows:
-        if not any(str(v).strip() for v in row):
-            continue  # lewati baris yang benar-benar kosong
-        row = (row + [""] * n)[:n]
-        records.append(dict(zip(expected_columns, row)))
-    return records
-
-
 # ----------------------------------------------------------------------
 # KONEKSI GOOGLE SHEETS
 # ----------------------------------------------------------------------
@@ -205,7 +181,7 @@ def init_data():
     _migrate_transaksi_schema()
 
     ws_proker = get_worksheet(PROKER_SHEET, PROKER_COLUMNS)
-    if not _get_records_safe(ws_proker, PROKER_COLUMNS):
+    if not _retry(ws_proker.get_all_records):
         _retry(ws_proker.append_row, PROKER_DEFAULT, value_input_option="USER_ENTERED")
 
     get_worksheet(ANGGOTA_SHEET, ANGGOTA_COLUMNS)
@@ -221,7 +197,7 @@ def init_data():
 @st.cache_data(ttl=15, show_spinner=False)
 def load_transaksi() -> pd.DataFrame:
     ws = get_worksheet(TRANSAKSI_SHEET, TRANSAKSI_COLUMNS)
-    records = _get_records_safe(ws, TRANSAKSI_COLUMNS)
+    records = _retry(ws.get_all_records)
     df = pd.DataFrame(records)
     if df.empty:
         df = pd.DataFrame(columns=TRANSAKSI_COLUMNS)
@@ -321,7 +297,7 @@ def delete_transaksi(id_):
 @st.cache_data(ttl=15, show_spinner=False)
 def load_proker() -> list:
     ws = get_worksheet(PROKER_SHEET, PROKER_COLUMNS)
-    records = _get_records_safe(ws, PROKER_COLUMNS)
+    records = _retry(ws.get_all_records)
     if not records:
         return PROKER_DEFAULT.copy()
     hasil = [str(r.get("Nama Proker", "")).strip() for r in records]
@@ -360,7 +336,7 @@ def delete_proker(nama: str):
 @st.cache_data(ttl=15, show_spinner=False)
 def load_anggota() -> list:
     ws = get_worksheet(ANGGOTA_SHEET, ANGGOTA_COLUMNS)
-    records = _get_records_safe(ws, ANGGOTA_COLUMNS)
+    records = _retry(ws.get_all_records)
     hasil = [str(r.get("Nama Anggota", "")).strip() for r in records]
     return [a for a in hasil if a]
 
@@ -397,7 +373,7 @@ def delete_anggota(nama: str):
 @st.cache_data(ttl=15, show_spinner=False)
 def load_pengaturan() -> dict:
     ws = get_worksheet(PENGATURAN_SHEET, PENGATURAN_COLUMNS)
-    records = _get_records_safe(ws, PENGATURAN_COLUMNS)
+    records = _retry(ws.get_all_records)
     return {str(r.get("Key", "")): r.get("Value", "") for r in records}
 
 
@@ -429,9 +405,40 @@ def set_nominal_kas_mingguan(value):
 # ----------------------------------------------------------------------
 @st.cache_data(ttl=15, show_spinner=False)
 def load_iuran() -> pd.DataFrame:
+    """Muat data Iuran Kas.
+
+    Sengaja pakai get_all_values() + pemetaan kolom manual (bukan
+    get_all_records()) supaya kebal terhadap masalah baris header di sheet
+    (header kosong/duplikat/kolom ekstra) yang biasanya bikin gspread
+    melempar GSpreadException.
+    """
     ws = get_worksheet(IURAN_SHEET, IURAN_COLUMNS)
-    records = _get_records_safe(ws, IURAN_COLUMNS)
-    df = pd.DataFrame(records)
+    all_values = _retry(ws.get_all_values)
+    if not all_values or len(all_values) < 2:
+        return pd.DataFrame(columns=IURAN_COLUMNS)
+
+    header = all_values[0]
+    data_rows = all_values[1:]
+
+    # Petakan tiap kolom yang diharapkan (IURAN_COLUMNS) ke posisinya di
+    # header sheet. Kolom header yang kosong/duplikat/tidak dikenal diabaikan.
+    col_index = {}
+    for idx, nama_kolom in enumerate(header):
+        nama_kolom = nama_kolom.strip()
+        if nama_kolom in IURAN_COLUMNS and nama_kolom not in col_index:
+            col_index[nama_kolom] = idx
+
+    records = []
+    for row in data_rows:
+        if not any(cell.strip() for cell in row):
+            continue  # lewati baris yang benar-benar kosong
+        record = {
+            kolom: (row[col_index[kolom]] if kolom in col_index and col_index[kolom] < len(row) else "")
+            for kolom in IURAN_COLUMNS
+        }
+        records.append(record)
+
+    df = pd.DataFrame(records, columns=IURAN_COLUMNS)
     if df.empty:
         df = pd.DataFrame(columns=IURAN_COLUMNS)
     else:
@@ -447,7 +454,20 @@ def _next_iuran_id(df: pd.DataFrame) -> int:
 
 
 def mark_iuran_paid(minggu_label: str, nama: str, tanggal_bayar):
-    """Tandai anggota sudah bayar iuran minggu tsb: buat transaksi Pemasukan + catatan iuran."""
+    """Tandai anggota sudah bayar iuran minggu tsb: buat transaksi Pemasukan + catatan iuran.
+
+    Idempoten: jika anggota tsb sudah tercatat bayar untuk minggu yang sama
+    (misalnya karena checkbox ter-klik dua kali/koneksi lambat), fungsi ini
+    TIDAK akan membuat transaksi/catatan baru lagi - supaya kas tidak
+    tercatat dobel.
+    """
+    df_iuran = load_iuran()
+    sudah_tercatat = not df_iuran[
+        (df_iuran["Minggu"] == minggu_label) & (df_iuran["Nama Anggota"] == nama)
+    ].empty
+    if sudah_tercatat:
+        return df_iuran
+
     nominal = get_nominal_kas_mingguan()
     df_trans = add_transaksi(
         tanggal_bayar, "Pemasukan", "Kas Umum", PROKER_UMUM_PLACEHOLDER, "Kas Anggota",
@@ -456,7 +476,6 @@ def mark_iuran_paid(minggu_label: str, nama: str, tanggal_bayar):
     new_trans_id = int(df_trans["ID"].max()) if not df_trans.empty else 0
 
     ws = get_worksheet(IURAN_SHEET, IURAN_COLUMNS)
-    df_iuran = load_iuran()
     new_id = _next_iuran_id(df_iuran)
     row = [new_id, minggu_label, nama, str(tanggal_bayar), new_trans_id]
     _retry(ws.append_row, row, value_input_option="USER_ENTERED")
@@ -465,25 +484,33 @@ def mark_iuran_paid(minggu_label: str, nama: str, tanggal_bayar):
 
 
 def unmark_iuran_paid(minggu_label: str, nama: str):
-    """Batalkan status sudah bayar: hapus transaksi terkait + catatan iuran."""
+    """Batalkan status sudah bayar: hapus transaksi terkait + catatan iuran.
+
+    Menghapus SEMUA baris yang cocok (bukan cuma yang pertama), untuk
+    membersihkan sisa data dobel jika pernah tercatat lebih dari sekali
+    sebelum guard anti-duplikat ini ada.
+    """
     df_iuran = load_iuran()
     match = df_iuran[(df_iuran["Minggu"] == minggu_label) & (df_iuran["Nama Anggota"] == nama)]
     if match.empty:
         return load_iuran()
 
-    row = match.iloc[0]
-    id_transaksi = int(row["ID Transaksi"])
-    id_iuran = int(row["ID"])
+    for _, row in match.iterrows():
+        id_transaksi = int(row["ID Transaksi"])
+        id_iuran = int(row["ID"])
 
-    if id_transaksi:
-        delete_transaksi(id_transaksi)
+        if id_transaksi:
+            delete_transaksi(id_transaksi)
 
-    ws = get_worksheet(IURAN_SHEET, IURAN_COLUMNS)
-    row_idx = _find_row_index(ws, id_iuran)
-    if row_idx is not None:
-        _retry(ws.delete_rows, row_idx)
+        ws = get_worksheet(IURAN_SHEET, IURAN_COLUMNS)
+        row_idx = _find_row_index(ws, id_iuran)
+        if row_idx is not None:
+            _retry(ws.delete_rows, row_idx)
+
     load_iuran.clear()
     return load_iuran()
+
+
 
 
 # ----------------------------------------------------------------------
